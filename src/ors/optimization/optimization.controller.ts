@@ -28,6 +28,7 @@ export class OptimizationController {
             '/optimization',
             body,
             auth,
+            process.env.VROOM_BASE_URL,
         ) as Promise<OptimizationResponse>;
     }
 }

@@ -12,6 +12,7 @@ export class OrsService {
         path: string,
         body: object,
         authHeader?: string,
+        baseUrl?: string,
     ): Promise<unknown> {
         const headers: Record<string, string> = {
             'Content-Type': 'application/json',
@@ -21,7 +22,7 @@ export class OrsService {
             headers['Authorization'] = authHeader;
         }
 
-        const response = await fetch(`${this.baseUrl}${path}`, {
+        const response = await fetch(`${baseUrl ?? this.baseUrl}${path}`, {
             method: 'POST',
             headers,
             body: JSON.stringify(body),
