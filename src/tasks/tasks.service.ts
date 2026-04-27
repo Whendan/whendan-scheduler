@@ -3,8 +3,9 @@ import { Cron, CronExpression } from '@nestjs/schedule';
 import { InjectDataSource } from '@nestjs/typeorm';
 import { DataSource } from 'typeorm';
 import { DatabaseService } from '../database/database.service';
+import type { BuildResult } from '../database/database.types';
 import { OrsService } from '../ors/ors.service';
-import type { OptimizationResponse } from '../ors/ors.types';
+import type { DirectionsRequest, OptimizationResponse, OptimizationRoute } from '../ors/ors.types';
 
 /** Target local hour at which nightly optimization runs. */
 const OPTIMIZATION_HOUR = 2;
@@ -146,9 +147,13 @@ export class TasksService implements OnApplicationBootstrap {
                 process.env.ORS_API_KEY ? `Bearer ${process.env.ORS_API_KEY}` : undefined,
             )) as OptimizationResponse;
 
+            const routeGeoJsonPromise = this.requestRouteGeoJsons(request, response, warehouseId);
+
             await this.databaseService.insertOptimisedRoutes(
                 runner, request, response, vehicleMap, jobMap, driverMap,
             );
+            const routeGeoJson = await routeGeoJsonPromise;
+            
             await runner.commitTransaction();
             this.logger.log(`Warehouse ${warehouseId}: optimization committed successfully.`);
         } catch (err) {
@@ -178,5 +183,91 @@ export class TasksService implements OnApplicationBootstrap {
      */
     private getLocalDate(date: Date, tzid: string): string {
         return new Intl.DateTimeFormat('en-CA', { timeZone: tzid }).format(date);
+    }
+
+    private async requestRouteGeoJsons(
+        request: BuildResult['request'],
+        response: OptimizationResponse,
+        warehouseId: string,
+    ): Promise<DirectionsRequest | null> {
+        const authHeader = process.env.ORS_API_KEY ? `Bearer ${process.env.ORS_API_KEY}` : undefined;
+        let primaryRouteRequest: DirectionsRequest | null = null;
+
+        const directionRequests = (response.routes ?? [])
+            .map((route) => {
+                const profile = request.vehicles.find((vehicle) => vehicle.id === route.vehicle)?.profile;
+                if (!profile) {
+                    this.logger.warn(
+                        `Warehouse ${warehouseId}: skipping GeoJSON directions for vehicle ${route.vehicle} because no ORS profile was found.`,
+                    );
+                    return null;
+                }
+
+                const body = this.buildDirectionsGeoJsonRequest(route);
+                if (!body) {
+                    this.logger.debug(
+                        `Warehouse ${warehouseId}: skipping GeoJSON directions for vehicle ${route.vehicle} because fewer than two route coordinates were available.`,
+                    );
+                    return null;
+                }
+
+                primaryRouteRequest ??= body;
+
+                return this.orsService.proxyPost(
+                    `/v2/directions/${profile}/geojson`,
+                    body,
+                    authHeader,
+                );
+            })
+            .filter((promise): promise is Promise<unknown> => promise !== null);
+
+        if (directionRequests.length === 0) {
+            return null;
+        }
+
+        const results = await Promise.allSettled(directionRequests);
+        const failures = results.filter((result) => result.status === 'rejected');
+
+        if (failures.length > 0) {
+            this.logger.warn(
+                `Warehouse ${warehouseId}: ${failures.length} GeoJSON directions request(s) failed after optimization completed.`,
+            );
+
+            failures.forEach((failure) => {
+                this.logger.warn(String(failure.reason));
+            });
+            return primaryRouteRequest;
+        }
+
+        this.logger.debug(
+            `Warehouse ${warehouseId}: fetched ${results.length} GeoJSON route(s) after optimization.`,
+        );
+
+        return primaryRouteRequest;
+    }
+
+    private buildDirectionsGeoJsonRequest(route: OptimizationRoute): DirectionsRequest | null {
+        const coordinates = route.steps
+            .map((step) => step.location)
+            .filter((location): location is number[] => Array.isArray(location) && location.length >= 2)
+            .reduce<number[][]>((accumulator, location) => {
+                const [lon, lat] = location;
+                const previous = accumulator[accumulator.length - 1];
+
+                if (!previous || previous[0] !== lon || previous[1] !== lat) {
+                    accumulator.push([lon, lat]);
+                }
+
+                return accumulator;
+            }, []);
+
+        if (coordinates.length < 2) {
+            return null;
+        }
+
+        return {
+            coordinates,
+            instructions: false,
+        };
     }
 }
