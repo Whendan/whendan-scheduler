@@ -1,8 +1,10 @@
 services:
   scheduler:
-    build:
-      context: .
-      dockerfile: Dockerfile
+   # For local development, build the image from the local Dockerfile to pick up changes more quickly. For production, pull from the registry.
+    image: ghcr.io/whendan/whendan-scheduler:main
+   # build:
+   #   context: .
+   #   dockerfile: Dockerfile
     ports:
       - "${PORT:-3002}:3002"
     env_file:
@@ -16,3 +18,23 @@ services:
       ORS_API_KEY: ${ORS_API_KEY}
       VROOM_BASE_URL: ${VROOM_BASE_URL:-http://localhost:3000}
     restart: unless-stopped
+  vroom:
+    image: ghcr.io/vroom-project/vroom-docker:v1.15.0
+    container_name: vroom
+    volumes:
+      - ./vroom-conf/:/conf
+    environment:
+      - VROOM_ROUTER=ors
+  # For more information: https://github.com/GIScience/openrouteservice/blob/main/docker-compose.yml
+  ors-app:
+    image: openrouteservice/openrouteservice:v9.8.0
+    volumes: 
+      - ./ors-docker:/home/ors 
+      - ./graphs:/home/ors/graphs
+    environment:
+      REBUILD_GRAPHS: False  
+      CONTAINER_LOG_LEVEL: INFO 
+      XMS: 1g  # start RAM assigned to java
+      XMX: 2g  # max RAM assigned to java. Rule of Thumb: <PBF-size> * <profiles> * 2
+      # Example: 1.5 GB pbf size, two profiles (car and foot-walking)
+      # -> 1.5 * 2 * 2 = 6. Set xmx to be AT LEAST `-Xmx6g`
