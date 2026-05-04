@@ -7,6 +7,15 @@ import {
 import { SupabaseClient } from '@supabase/supabase-js';
 import { SUPABASE_CLIENT } from 'src/supabase/supabase.provider';
 import { CreateUserDto } from './dto/create-user.dto';
+import { DeactivateUsersDto } from './dto/deactivate-users.dto';
+
+// ~100 years — effectively permanent while preserving all associated data
+const DEACTIVATION_BAN_DURATION = '876600h';
+
+export interface DeactivateUsersResult {
+    deactivated: string[];
+    failed: Array<{ user_id: string; reason: string }>;
+}
 
 export interface CreateUserResult {
     user_id: string;
@@ -83,5 +92,54 @@ export class UsersService {
         }
 
         return result;
+    }
+
+    async deactivateUsers(
+        dto: DeactivateUsersDto,
+        callerUserId: string,
+    ): Promise<DeactivateUsersResult> {
+        const deactivated: string[] = [];
+        const failed: DeactivateUsersResult['failed'] = [];
+
+        const results = await Promise.allSettled(
+            dto.user_ids.map(async (userId) => {
+                if (userId === callerUserId) {
+                    throw new BadRequestException('Cannot deactivate your own account');
+                }
+
+                const { error: banError } =
+                    await this.supabase.auth.admin.updateUserById(userId, {
+                        ban_duration: DEACTIVATION_BAN_DURATION,
+                    });
+
+                if (banError) {
+                    throw new InternalServerErrorException(
+                        `Failed to ban user: ${banError.message}`,
+                    );
+                }
+
+                // Best-effort: revoke all refresh tokens. If this fails the user is
+                // still banned from obtaining new access tokens via the ban above.
+                await this.supabase.auth.admin.signOut(userId, 'global');
+
+                return userId;
+            }),
+        );
+
+        for (let i = 0; i < results.length; i++) {
+            const result = results[i];
+            const userId = dto.user_ids[i];
+            if (result.status === 'fulfilled') {
+                deactivated.push(result.value);
+            } else {
+                const reason =
+                    result.reason instanceof Error
+                        ? result.reason.message
+                        : String(result.reason);
+                failed.push({ user_id: userId, reason });
+            }
+        }
+
+        return { deactivated, failed };
     }
 }
