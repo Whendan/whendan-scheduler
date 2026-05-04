@@ -1,0 +1,301 @@
+# 21 — Logging
+
+## TL;DR
+
+- **nestjs-pino** for structured JSON logs in production, pretty in development.
+- Every log line includes: `level`, `time`, `traceId` (correlation id), `userId` (when authenticated), and `module` (auto-populated from `@InjectPinoLogger(ClassName.name)` as the pino `context` field).
+- **Redact** `authorization`, `cookie`, `set-cookie`, `password`, `token`, `secret`, `apiKey` in the pino config.
+- Log levels: `trace` (chatter), `debug` (dev), `info` (business events), `warn` (recoverable), `error` (5xx + unexpected).
+- 5xx logs include the stack at `error`. 4xx default to `debug` (client problem); escalate to `warn` only for security-relevant spikes (auth surges, rate-limit hits).
+- Never `console.log` in application code. Never log PII.
+
+## Why it matters
+
+Logs are the primary signal during incidents. Structured, correlated, redacted logs let you
+answer "what happened with this request?" in seconds. Unstructured `console.log` noise wastes
+storage and hides problems.
+
+## Install & setup
+
+Install peer deps with your project's package manager (`npm`, `pnpm`, `yarn`, or `bun`):
+
+- runtime: `nestjs-pino`, `pino`, `pino-http`
+- dev-only: `pino-pretty` — required by the development transport below; do not ship to production
+
+Augment `Express.Request` once so `req.id` and `req.user` are typed (no `as any`):
+
+```ts
+// types/express.d.ts (declared once, project-wide)
+import 'express';
+
+declare module 'express' {
+  interface Request {
+    id?: string;
+    user?: { id: string; orgId?: string; [k: string]: unknown };
+  }
+}
+```
+
+Then wire pino into the root module:
+
+```ts
+// app.module.ts
+import { randomUUID } from 'node:crypto';
+import { Module } from '@nestjs/common';
+import { LoggerModule } from 'nestjs-pino';
+import type { Request } from 'express';
+
+@Module({
+  imports: [
+    LoggerModule.forRootAsync({
+      inject: [ENV],
+      useFactory: (env: Env) => ({
+        pinoHttp: {
+          level: env.LOG_LEVEL,
+          transport:
+            env.NODE_ENV === 'development'
+              ? { target: 'pino-pretty', options: { singleLine: true, colorize: true } }
+              : undefined,
+          redact: {
+            // Pino wildcards are single-level (`*.password` matches `body.password` but
+            // NOT `body.user.password`). Add explicit nested paths for known shapes,
+            // or use the recursive `**` wildcard (pino >= 7) for unknown depth.
+            paths: [
+              'req.headers.authorization',
+              'req.headers.cookie',
+              'res.headers["set-cookie"]',
+              '*.password',
+              '*.passwordHash',
+              '*.token',
+              '*.apiKey',
+              '*.secret',
+              '*.ssn',
+              'email',          // log hash or masked form only — see "Never log" below
+            ],
+            censor: '[REDACTED]',
+          },
+          customProps: (req: Request) => ({
+            traceId: req.id,
+            userId: req.user?.id,
+            org: req.user?.orgId,
+            // `module` (logger context) is added automatically by
+            // `@InjectPinoLogger(ClassName.name)` — do not duplicate it here.
+          }),
+          genReqId: (req) => {
+            const incoming = req.headers['x-request-id'];
+            return typeof incoming === 'string' &&
+              incoming.trim().length > 0 &&
+              incoming.length < 128
+              ? incoming.trim()
+              : `req_${randomUUID()}`;
+          },
+          serializers: {
+            req: (req) => ({
+              id: req.id,
+              method: req.method,
+              url: req.url,
+              // deliberately omit headers and body to avoid PII
+            }),
+            res: (res) => ({
+              statusCode: res.statusCode,
+            }),
+          },
+        },
+      }),
+    }),
+  ],
+})
+export class AppModule {}
+```
+
+### Wire up in main.ts
+
+```ts
+import { NestFactory } from '@nestjs/core';
+import { Logger } from 'nestjs-pino';   // not '@nestjs/common' — pino's Logger token
+import { AppModule } from './app.module';
+
+const app = await NestFactory.create(AppModule, { bufferLogs: true });
+app.useLogger(app.get(Logger));
+```
+
+`bufferLogs` holds boot logs until the logger is ready — no dual outputs.
+
+## Usage in services
+
+```ts
+import { InjectPinoLogger, PinoLogger } from 'nestjs-pino';
+
+@Injectable()
+export class PaymentService {
+  constructor(@InjectPinoLogger(PaymentService.name) private readonly logger: PinoLogger) {}
+
+  async charge(userId: string, amount: number) {
+    this.logger.info({ userId, amount }, 'charging user');
+    try {
+      const p = await this.stripe.charge(/* ... */);
+      this.logger.info({ paymentId: p.id, userId }, 'payment captured');
+      return p;
+    } catch (e) {
+      // Pick the level by *cause*, not by the fact that it threw:
+      // - card declined / user input issue  → `warn`
+      // - upstream outage / unexpected bug  → `error`
+      // Use the `err` key (not `error`) so pino's stdSerializer formats stack/type/message.
+      this.logger.warn({ err: e, userId, amount }, 'charge failed');
+      throw e;
+    }
+  }
+}
+```
+
+**Shape:** first arg = structured context object; second arg = human message.
+
+```ts
+logger.info({ userId, orderId }, 'order placed');     // ✅
+logger.info(`user ${userId} placed order ${orderId}`); // ❌ unstructured — harder to search
+```
+
+## Levels
+
+| Level | Use when |
+|---|---|
+| `trace` | Internal plumbing, request/response bodies (dev only) |
+| `debug` | Developer info: cache hit/miss, branch taken, baseline 4xx |
+| `info` | **Business events:** user signed in, payment captured, org created |
+| `warn` | Recoverable: retry, fallback to default, security-relevant 4xx spikes (401 bursts, rate-limit hits) |
+| `error` | 5xx, unhandled exceptions, data integrity issues |
+| `fatal` | Process-ending (rare; usually you'd crash and let the orchestrator restart) |
+
+Production default: `info`. Bump to `debug` temporarily when debugging.
+
+## What to log (checklist)
+
+**Always log at info:**
+- Sign-in / sign-out
+- Password reset / MFA enroll
+- Payment captured / refunded
+- Admin impersonation start/end
+- Role / permission changes
+- Data export / deletion
+- Long-running job start / complete
+
+**Never log:**
+- Passwords, tokens, API keys, cookies
+- Full email, phone, SSN, DOB, address (PII)
+- Full request / response bodies of sensitive endpoints
+- Environment values at boot
+- LLM prompts or completions containing user data (see `22-observability.md`)
+
+## Correlation
+
+Every log line has a `traceId`. Obtained from:
+- Incoming `X-Request-ID` if it is a valid bounded string (echo back the normalized value in the response)
+- Generated by pino's `genReqId` otherwise
+- Propagated to outbound calls as `X-Request-ID`
+
+Also propagate to background jobs (BullMQ) via job metadata. The job worker then logs with
+the same `traceId` — a single request's logs across services line up.
+
+## Lifecycle events (boot & shutdown)
+
+Log lifecycle transitions at `info` so you can correlate restarts with incidents:
+
+- **Boot:** app build/version, commit SHA, effective `NODE_ENV`, Node version, listening port. **Never** log resolved env values or secrets — see [`20-configuration.md`](./20-configuration.md).
+- **Readiness flip:** when readiness becomes `true` (post-migrations / dependency probes pass) and when it flips back to `false` at the start of shutdown.
+- **Shutdown:** signal received (`SIGTERM`/`SIGINT`), draining started, each subsystem closed (HTTP server, queue workers, DB pool), and the final "shutdown complete" line. Include elapsed ms so you can tell drain timeouts apart from clean exits.
+
+```ts
+this.logger.info({ signal, drainTimeoutMs }, 'shutdown: draining');
+this.logger.info({ subsystem: 'bullmq', closedMs: 142 }, 'shutdown: subsystem closed');
+this.logger.info({ totalMs: 980 }, 'shutdown: complete');
+```
+
+See [`34-health-shutdown.md`](./34-health-shutdown.md) for the coordinator that emits these.
+
+## Log output
+
+- **Production:** JSON to stdout. Container runtime (ECS, k8s) ships to the log aggregator.
+- **Development:** pretty-printed stdout.
+- **No files.** Container file systems are ephemeral; write to stdout, let infra route.
+
+## Log aggregation
+
+- Ship to Loki / CloudWatch / Datadog / Axiom / Grafana Cloud.
+- Index on: `traceId`, `userId`, `statusCode`, `level`, `module`, `err.code`.
+- Retention: 30d hot, 1y cold (adjust per compliance).
+
+## Alerts (drive from logs or metrics)
+
+- 5xx rate > X per 5 min
+- 401 surge (credential stuffing)
+- Outbound upstream error rate > X
+- Specific `err.code` thresholds (`PAYMENT.UPSTREAM_ERROR`)
+- Missing heartbeats from scheduled jobs
+
+Alerts live in `docs/OPERATIONS.md` / your oncall runbook. Don't bury them in code.
+
+## Performance
+
+- Logging at `info` on every hot path is usually fine — pino is fast.
+- At `debug` in prod only temporarily.
+- Lazy evaluation for expensive contexts:
+
+```ts
+if (this.logger.isLevelEnabled('debug')) {
+  this.logger.debug({ snapshot: computeExpensiveSnapshot() }, 'debug state');
+}
+```
+
+## Avoid
+
+- `console.log`. Use the injected logger or disable `no-console` only in scripts.
+- String-concatenation logging (`'user ' + id + ' did ' + thing`).
+- Logging stack traces on 4xx.
+- Logging the full SQL statement with values on every query (PII risk).
+- Logging secrets "just once to debug" in prod.
+
+## Good vs bad
+
+### Good
+
+```ts
+this.logger.info(
+  { userId, orderId, amountCents, traceId },
+  'order placed successfully',
+);
+```
+
+### Bad
+
+```ts
+console.log('order placed for user', userId, 'amount', amount);    // ❌ unstructured
+this.logger.info('password was ' + password);                       // ❌❌ secret
+this.logger.error('failed');                                        // ❌ no context
+```
+
+## Anti-patterns
+
+- Unstructured logs (human-readable only).
+- `JSON.stringify` in the message — pino already serializes the context object.
+- Logging the request body / headers without redaction.
+- Same message used for many different events (grep becomes useless).
+- Silent loggers (`winston` with no transport configured in prod).
+- Logging at `info` things that should be at `debug`, flooding prod.
+
+## Code review checklist
+
+- [ ] nestjs-pino registered globally; logger used (no `console.log`)
+- [ ] Redact paths cover `authorization`, `cookie`, `password`, `token`, secret patterns
+- [ ] Every request gets a `traceId`; propagated to outbound and jobs
+- [ ] Levels used correctly (info for business events, warn for recoverable, error for 5xx)
+- [ ] No PII in logs; no secrets in logs; no env values printed at boot
+- [ ] Log message is stable; context is the variable (so grep works)
+- [ ] 5xx includes stack trace context
+
+## See also
+
+- [`10-error-handling.md`](./10-error-handling.md) — logging policy for errors
+- [`11-security.md`](./11-security.md) — what's secret, what's PII
+- [`20-configuration.md`](./20-configuration.md) — boot logging without leaking env values
+- [`22-observability.md`](./22-observability.md) — traces + metrics beyond logs
+- [`34-health-shutdown.md`](./34-health-shutdown.md) — shutdown coordinator that emits lifecycle logs
