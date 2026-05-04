@@ -1,8 +1,9 @@
-import { Body, Controller, Delete, HttpCode, HttpStatus, Post, Req, UseGuards } from '@nestjs/common';
+import { Body, Controller, Delete, HttpCode, HttpStatus, Patch, Post, Req, UseGuards } from '@nestjs/common';
 import { PermissionGuard } from 'src/auth/guards/permission.guard';
 import { RequirePermission } from 'src/auth/decorators/required-permission.decorator';
 import { CreateUserDto } from './dto/create-user.dto';
 import { DeactivateUsersDto } from './dto/deactivate-users.dto';
+import { ReactivateUsersDto } from './dto/reactivate-users.dto';
 import { UsersService } from './users.service';
 
 @Controller('api/v1/users')
@@ -22,5 +23,12 @@ export class UsersController {
     @RequirePermission('team_members.delete')
     deactivateUsers(@Body() dto: DeactivateUsersDto, @Req() req: Request & { user: { id: string } }) {
         return this.usersService.deactivateUsers(dto, req.user.id);
+    }
+
+    @Patch('reactivate')
+    @HttpCode(HttpStatus.OK)
+    @RequirePermission('team_members.edit')
+    reactivateUsers(@Body() dto: ReactivateUsersDto) {
+        return this.usersService.reactivateUsers(dto);
     }
 }

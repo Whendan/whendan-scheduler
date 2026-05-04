@@ -8,12 +8,18 @@ import { SupabaseClient } from '@supabase/supabase-js';
 import { SUPABASE_CLIENT } from 'src/supabase/supabase.provider';
 import { CreateUserDto } from './dto/create-user.dto';
 import { DeactivateUsersDto } from './dto/deactivate-users.dto';
+import { ReactivateUsersDto } from './dto/reactivate-users.dto';
 
 // ~100 years — effectively permanent while preserving all associated data
 const DEACTIVATION_BAN_DURATION = '876600h';
 
 export interface DeactivateUsersResult {
     deactivated: string[];
+    failed: Array<{ user_id: string; reason: string }>;
+}
+
+export interface ReactivateUsersResult {
+    reactivated: string[];
     failed: Array<{ user_id: string; reason: string }>;
 }
 
@@ -141,5 +147,45 @@ export class UsersService {
         }
 
         return { deactivated, failed };
+    }
+
+    async reactivateUsers(
+        dto: ReactivateUsersDto,
+    ): Promise<ReactivateUsersResult> {
+        const reactivated: string[] = [];
+        const failed: ReactivateUsersResult['failed'] = [];
+
+        const results = await Promise.allSettled(
+            dto.user_ids.map(async (userId) => {
+                const { error: unbanError } =
+                    await this.supabase.auth.admin.updateUserById(userId, {
+                        ban_duration: 'none',
+                    });
+
+                if (unbanError) {
+                    throw new InternalServerErrorException(
+                        `Failed to reactivate user: ${unbanError.message}`,
+                    );
+                }
+
+                return userId;
+            }),
+        );
+
+        for (let i = 0; i < results.length; i++) {
+            const result = results[i];
+            const userId = dto.user_ids[i];
+            if (result.status === 'fulfilled') {
+                reactivated.push(result.value);
+            } else {
+                const reason =
+                    result.reason instanceof Error
+                        ? result.reason.message
+                        : String(result.reason);
+                failed.push({ user_id: userId, reason });
+            }
+        }
+
+        return { reactivated, failed };
     }
 }
