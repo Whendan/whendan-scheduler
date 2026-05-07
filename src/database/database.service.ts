@@ -44,6 +44,11 @@ export class DatabaseService implements OnApplicationBootstrap {
         return runner;
     }
 
+    /** Executes a parameterised SQL query outside of a transaction. */
+    async query<T = unknown>(sql: string, params?: unknown[]): Promise<T[]> {
+        return this.dataSource.query(sql, params);
+    }
+
     /**
      * Fetches pending unassigned packages and active driver–vehicle assignments,
      * returning a ready-to-send ORS OptimizationRequest plus the lookup maps
