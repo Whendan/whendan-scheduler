@@ -6,12 +6,19 @@ import { DatabaseService } from '../database/database.service';
 import type { BuildResult } from '../database/database.types';
 import { OrsService } from '../ors/ors.service';
 import type { DirectionsRequest, OptimizationResponse, OptimizationRoute } from '../ors/ors.types';
+import { QueueService } from './queue.service';
 
 /** Target local hour at which nightly optimization runs. */
 const OPTIMIZATION_HOUR = 2;
 
 /** How often (ms) the in-memory warehouse→timezone cache is refreshed. */
 const CACHE_TTL_MS = 60 * 60 * 1000; // 1 hour
+
+/** Visibility timeout (seconds) held on a queue message while optimization runs. */
+const QUEUE_VT_SECONDS = 1800; // 30 min
+
+/** Maximum consumer attempts before a message is permanently discarded. */
+const MAX_RETRIES = 3;
 
 interface WarehouseTimezoneRow {
     id: string;
@@ -30,6 +37,7 @@ export class TasksService implements OnApplicationBootstrap {
         @InjectDataSource() private readonly dataSource: DataSource,
         private readonly databaseService: DatabaseService,
         private readonly orsService: OrsService,
+        private readonly queueService: QueueService,
     ) { }
 
     /**
@@ -38,6 +46,7 @@ export class TasksService implements OnApplicationBootstrap {
      * run it immediately — unless the scheduler_runs record already exists.
      */
     async onApplicationBootstrap(): Promise<void> {
+        await this.queueService.ensureQueue();
         await this.refreshWarehouseCache();
         await this.checkAndRunOptimizations('boot');
     }
@@ -52,6 +61,55 @@ export class TasksService implements OnApplicationBootstrap {
             await this.refreshWarehouseCache();
         }
         await this.checkAndRunOptimizations('cron');
+    }
+
+    /**
+     * Consumer: polls the pgmq queue every 30 seconds and processes one message
+     * at a time. Concurrency of 1 eliminates thundering-herd pressure on the
+     * database and ORS. Messages that fail are retried automatically when the
+     * visibility timeout expires; after MAX_RETRIES the message is deleted and
+     * the run is marked failed.
+     */
+    @Cron('*/30 * * * * *')
+    async handleQueue(): Promise<void> {
+        const msg = await this.queueService.readOne(QUEUE_VT_SECONDS);
+        if (!msg) return;
+
+        const { warehouseId, runDate } = msg.message as { warehouseId: string; runDate: string };
+        this.logger.log(`[consumer] Processing optimization for warehouse ${warehouseId} (run_date: ${runDate}).`);
+
+        try {
+            await this.runOptimization(warehouseId);
+            await this.queueService.archive(msg.msg_id);
+            await this.dataSource.query(
+                `UPDATE scheduler_runs SET status = 'completed' WHERE warehouse_id = $1 AND run_date = $2::date`,
+                [warehouseId, runDate],
+            );
+            this.logger.log(`[consumer] Warehouse ${warehouseId}: optimization completed for ${runDate}.`);
+        } catch (err: unknown) {
+            const rows: { retry_count: number }[] = await this.dataSource.query(
+                `UPDATE scheduler_runs SET retry_count = retry_count + 1
+                 WHERE warehouse_id = $1 AND run_date = $2::date
+                 RETURNING retry_count`,
+                [warehouseId, runDate],
+            );
+            const retryCount = rows[0]?.retry_count ?? MAX_RETRIES;
+
+            if (retryCount >= MAX_RETRIES) {
+                this.logger.error(
+                    `[consumer] Warehouse ${warehouseId}: optimization permanently failed after ${MAX_RETRIES} attempts for ${runDate}. Error: ${String(err)}`,
+                );
+                await this.queueService.deleteMsg(msg.msg_id);
+                await this.dataSource.query(
+                    `UPDATE scheduler_runs SET status = 'failed' WHERE warehouse_id = $1 AND run_date = $2::date`,
+                    [warehouseId, runDate],
+                );
+            } else {
+                this.logger.warn(
+                    `[consumer] Warehouse ${warehouseId}: optimization failed (attempt ${retryCount}/${MAX_RETRIES}) for ${runDate}. Retrying after VT expires. Error: ${String(err)}`,
+                );
+            }
+        }
     }
 
     /**
@@ -117,15 +175,10 @@ export class TasksService implements OnApplicationBootstrap {
                 continue;
             }
 
+            await this.queueService.enqueue(warehouse.id, localDate);
             this.logger.log(
-                `[${trigger}] Warehouse ${warehouse.id}: starting optimization for ${localDate} (tz: ${tzid})`,
+                `[${trigger}] Warehouse ${warehouse.id}: enqueued optimization for ${localDate} (tz: ${tzid})`,
             );
-
-            await this.runOptimization(warehouse.id).catch((err: unknown) => {
-                this.logger.error(
-                    `Optimization failed for warehouse ${warehouse.id}: ${String(err)}`,
-                );
-            });
         }
     }
 
@@ -153,7 +206,7 @@ export class TasksService implements OnApplicationBootstrap {
                 runner, request, response, vehicleMap, jobMap, driverMap,
             );
             const routeGeoJson = await routeGeoJsonPromise;
-            
+
             await runner.commitTransaction();
             this.logger.log(`Warehouse ${warehouseId}: optimization committed successfully.`);
         } catch (err) {
