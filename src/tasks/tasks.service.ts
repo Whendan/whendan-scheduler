@@ -200,12 +200,10 @@ export class TasksService implements OnApplicationBootstrap {
                 process.env.ORS_API_KEY ? `Bearer ${process.env.ORS_API_KEY}` : undefined,
             )) as OptimizationResponse;
 
-            const routeGeoJsonPromise = this.requestRouteGeoJsons(request, response, warehouseId);
 
             await this.databaseService.insertOptimisedRoutes(
                 runner, request, response, vehicleMap, jobMap, driverMap,
             );
-            const routeGeoJson = await routeGeoJsonPromise;
 
             await runner.commitTransaction();
             this.logger.log(`Warehouse ${warehouseId}: optimization committed successfully.`);
