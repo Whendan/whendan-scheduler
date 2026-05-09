@@ -1,8 +1,9 @@
 import { Injectable, Logger, OnApplicationBootstrap } from '@nestjs/common';
 import { Cron, CronExpression } from '@nestjs/schedule';
-import { InjectDataSource } from '@nestjs/typeorm';
-import { DataSource } from 'typeorm';
+import { InjectDataSource, InjectRepository } from '@nestjs/typeorm';
+import { DataSource, Repository } from 'typeorm';
 import { DatabaseService } from '../database/database.service';
+import { SchedulerRun } from 'src/entities/scheduler-run.entity';
 import type { BuildResult } from '../database/database.types';
 import { OrsService } from '../ors/ors.service';
 import type { DirectionsRequest, OptimizationResponse, OptimizationRoute } from '../ors/ors.types';
@@ -35,6 +36,7 @@ export class TasksService implements OnApplicationBootstrap {
 
     constructor(
         @InjectDataSource() private readonly dataSource: DataSource,
+        @InjectRepository(SchedulerRun) private readonly schedulerRunRepo: Repository<SchedulerRun>,
         private readonly databaseService: DatabaseService,
         private readonly orsService: OrsService,
         private readonly queueService: QueueService,
@@ -81,28 +83,29 @@ export class TasksService implements OnApplicationBootstrap {
         try {
             await this.runOptimization(warehouseId);
             await this.queueService.archive(msg.msg_id);
-            await this.dataSource.query(
-                `UPDATE scheduler_runs SET status = 'completed' WHERE warehouse_id = $1 AND run_date = $2::date`,
-                [warehouseId, runDate],
+            await this.schedulerRunRepo.update(
+                { warehouseId, runDate },
+                { status: 'completed' },
             );
             this.logger.log(`[consumer] Warehouse ${warehouseId}: optimization completed for ${runDate}.`);
         } catch (err: unknown) {
-            const rows: { retry_count: number }[] = await this.dataSource.query(
-                `UPDATE scheduler_runs SET retry_count = retry_count + 1
-                 WHERE warehouse_id = $1 AND run_date = $2::date
-                 RETURNING retry_count`,
-                [warehouseId, runDate],
-            );
-            const retryCount = rows[0]?.retry_count ?? MAX_RETRIES;
+            const result = await this.schedulerRunRepo
+                .createQueryBuilder()
+                .update()
+                .set({ retryCount: () => 'retry_count + 1' })
+                .where('warehouse_id = :wh AND run_date = :rd', { wh: warehouseId, rd: runDate })
+                .returning('retry_count')
+                .execute();
+            const retryCount: number = result.raw[0]?.retry_count ?? MAX_RETRIES;
 
             if (retryCount >= MAX_RETRIES) {
                 this.logger.error(
                     `[consumer] Warehouse ${warehouseId}: optimization permanently failed after ${MAX_RETRIES} attempts for ${runDate}. Error: ${String(err)}`,
                 );
                 await this.queueService.deleteMsg(msg.msg_id);
-                await this.dataSource.query(
-                    `UPDATE scheduler_runs SET status = 'failed' WHERE warehouse_id = $1 AND run_date = $2::date`,
-                    [warehouseId, runDate],
+                await this.schedulerRunRepo.update(
+                    { warehouseId, runDate },
+                    { status: 'failed' },
                 );
             } else {
                 this.logger.warn(
@@ -160,15 +163,16 @@ export class TasksService implements OnApplicationBootstrap {
 
             // Atomic claim — unique constraint on (warehouse_id, run_date) means
             // only one winner per warehouse per local calendar day.
-            const claimed: { id: string }[] = await this.dataSource.query(
-                `INSERT INTO scheduler_runs (warehouse_id, run_date)
-                 VALUES ($1, $2::date)
-                 ON CONFLICT (warehouse_id, run_date) DO NOTHING
-                 RETURNING id`,
-                [warehouse.id, localDate],
-            );
+            const claimResult = await this.dataSource
+                .createQueryBuilder()
+                .insert()
+                .into(SchedulerRun)
+                .values({ warehouseId: warehouse.id, runDate: localDate })
+                .orIgnore()
+                .returning('id')
+                .execute();
 
-            if (claimed.length === 0) {
+            if (claimResult.identifiers.length === 0) {
                 this.logger.debug(
                     `[${trigger}] Warehouse ${warehouse.id}: already ran for ${localDate}, skipping.`,
                 );

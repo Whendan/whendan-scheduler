@@ -1,6 +1,12 @@
 import { Injectable, Logger, OnApplicationBootstrap } from '@nestjs/common';
-import { InjectDataSource } from '@nestjs/typeorm';
-import { DataSource, QueryRunner } from 'typeorm';
+import { InjectDataSource, InjectRepository } from '@nestjs/typeorm';
+import { DataSource, In, QueryRunner, Repository } from 'typeorm';
+import { Package } from 'src/entities/package.entity';
+import { PackageAssignment } from 'src/entities/package-assignment.entity';
+import { PackageStatus } from 'src/entities/package-status.entity';
+import { VrpOptimization } from 'src/entities/vrp-optimization.entity';
+import { VrpRoute } from 'src/entities/vrp-route.entity';
+import { VrpSolution } from 'src/entities/vrp-solution.entity';
 import type { OptimizationResponse } from '../ors/ors.types';
 import type {
     AssignmentRow,
@@ -19,17 +25,20 @@ export class DatabaseService implements OnApplicationBootstrap {
 
     constructor(
         @InjectDataSource() private readonly dataSource: DataSource,
+        @InjectRepository(PackageStatus) private readonly packageStatusRepo: Repository<PackageStatus>,
+        @InjectRepository(Package) private readonly packageRepo: Repository<Package>,
+        @InjectRepository(PackageAssignment) private readonly packageAssignmentRepo: Repository<PackageAssignment>,
+        @InjectRepository(VrpOptimization) private readonly vrpOptimizationRepo: Repository<VrpOptimization>,
+        @InjectRepository(VrpSolution) private readonly vrpSolutionRepo: Repository<VrpSolution>,
+        @InjectRepository(VrpRoute) private readonly vrpRouteRepo: Repository<VrpRoute>,
     ) { }
 
     async onApplicationBootstrap(): Promise<void> {
-        const rows: { id: number }[] = await this.dataSource.query(
-            `SELECT id FROM package_status WHERE enums = $1`,
-            ['PENDING'],
-        );
-        if (!rows.length) {
+        const status = await this.packageStatusRepo.findOneBy({ enums: 'PENDING' });
+        if (!status) {
             throw new Error('package_status row with enums = \'PENDING\' not found.');
         }
-        this.pendingStatusId = rows[0].id;
+        this.pendingStatusId = status.id;
         this.logger.log(`Resolved PENDING status id: ${this.pendingStatusId}`);
     }
 
@@ -251,17 +260,12 @@ export class DatabaseService implements OnApplicationBootstrap {
         const optimisedPackageIds = new Set<string>();
 
         // 1. vrp_optimization — store raw request/response for auditability.
-        const optRows: { id: string }[] = await runner.query(
-            `INSERT INTO vrp_optimization (provider, request, response)
-       VALUES ($1, $2::jsonb, $3::jsonb)
-       RETURNING id`,
-            [
-                'openrouteservice',
-                JSON.stringify(requestPayload),
-                JSON.stringify(optimisationResponse),
-            ],
-        );
-        const optimizationId: string = optRows[0].id;
+        const optResult = await runner.manager.insert(VrpOptimization, {
+            provider: 'openrouteservice',
+            request: requestPayload,
+            response: optimisationResponse,
+        });
+        const optimizationId: string = optResult.identifiers[0].id;
 
         // 2. vrp_solution — summary stats from the ORS response.
         const summary = optimisationResponse.summary ?? {};
@@ -271,34 +275,24 @@ export class DatabaseService implements OnApplicationBootstrap {
             | { loading?: number; solving?: number; routing?: number }
             | undefined;
 
-        const solRows: { id: string }[] = await runner.query(
-            `INSERT INTO vrp_solution (
-         optimization_id,
-         cost, routes_count, unassigned_count,
-         delivery, amount, pickup,
-         setup, service, duration, waiting_time, priority,
-         loading_time, solving_time, routing_time
-       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
-       RETURNING id`,
-            [
-                optimizationId,
-                summary.cost ?? null,
-                summary.routes ?? null,
-                summary.unassigned ?? null,
-                summary.delivery ?? null,
-                (summary as Record<string, unknown>).amount ?? null,
-                summary.pickup ?? null,
-                summary.setup ?? null,
-                summary.service ?? null,
-                summary.duration ?? null,
-                summary.waiting_time ?? null,
-                summary.priority ?? null,
-                computingTimes?.loading ?? 0,
-                computingTimes?.solving ?? 0,
-                computingTimes?.routing ?? 0,
-            ],
-        );
-        const solutionId: string = solRows[0].id;
+        const solResult = await runner.manager.insert(VrpSolution, {
+            optimizationId,
+            cost: summary.cost ?? null,
+            routesCount: summary.routes ?? null,
+            unassignedCount: summary.unassigned ?? null,
+            delivery: summary.delivery != null ? [summary.delivery] : null,
+            amount: (summary as Record<string, unknown>).amount as number[] ?? null,
+            pickup: summary.pickup != null ? [summary.pickup] : null,
+            setup: summary.setup ?? null,
+            service: summary.service ?? null,
+            duration: summary.duration ?? null,
+            waitingTime: summary.waiting_time ?? null,
+            priority: summary.priority ?? null,
+            loadingTime: computingTimes?.loading ?? 0,
+            solvingTime: computingTimes?.solving ?? 0,
+            routingTime: computingTimes?.routing ?? 0,
+        });
+        const solutionId: string = solResult.identifiers[0].id;
 
         // 3. Routes.
         for (const route of optimisationResponse.routes ?? []) {
@@ -309,27 +303,19 @@ export class DatabaseService implements OnApplicationBootstrap {
                 priority?: number;
             };
 
-            const routeRows: { id: string }[] = await runner.query(
-                `INSERT INTO vrp_route (
-           solution_id,
-           cost, delivery, amount, pickup,
-           setup, service, duration, waiting_time, priority
-         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
-         RETURNING id`,
-                [
-                    solutionId,
-                    route.cost ?? null,
-                    route.delivery ?? null,
-                    routeExt.amount ?? null,
-                    route.pickup ?? null,
-                    routeExt.setup ?? null,
-                    route.service ?? null,
-                    route.duration ?? null,
-                    route.waiting_time ?? null,
-                    routeExt.priority ?? null,
-                ],
-            );
-            const routeId: string = routeRows[0].id;
+            const routeResult = await runner.manager.insert(VrpRoute, {
+                solutionId,
+                cost: route.cost ?? null,
+                delivery: route.delivery ?? null,
+                amount: routeExt.amount ?? null,
+                pickup: route.pickup ?? null,
+                setup: routeExt.setup ?? null,
+                service: route.service ?? null,
+                duration: route.duration ?? null,
+                waitingTime: route.waiting_time ?? null,
+                priority: routeExt.priority ?? null,
+            });
+            const routeId: string = routeResult.identifiers[0].id;
 
             // Collect steps and package assignments for this route.
             const stepsPayload: StepInsertRow[] = [];
@@ -398,11 +384,10 @@ export class DatabaseService implements OnApplicationBootstrap {
 
         // 4. Mark all processed packages so they are excluded from future runs.
         if (optimisedPackageIds.size > 0) {
-            await runner.query(
-                `UPDATE packages
-         SET    optimisation_id = $1
-         WHERE  id = ANY($2::uuid[])`,
-                [optimizationId, Array.from(optimisedPackageIds)],
+            await runner.manager.update(
+                Package,
+                { id: In(Array.from(optimisedPackageIds)) },
+                { optimisationId: optimizationId },
             );
         }
     }
@@ -419,24 +404,14 @@ export class DatabaseService implements OnApplicationBootstrap {
         runner: QueryRunner,
         assignments: { package_id: string; vehicle_id: string; driver_id: string }[],
     ): Promise<void> {
-        const placeholders = assignments
-            .map((_, i) => `($${i * 3 + 1}, $${i * 3 + 2}, $${i * 3 + 3})`)
-            .join(', ');
-
-        const params = assignments.flatMap((a) => [
-            a.package_id,
-            a.vehicle_id,
-            a.driver_id,
-        ]);
-
-        await runner.query(
-            `INSERT INTO package_assignment (package_id, vehicle_id, driver_id)
-       VALUES ${placeholders}
-       ON CONFLICT (package_id)
-       DO UPDATE SET
-         vehicle_id = EXCLUDED.vehicle_id,
-         driver_id  = EXCLUDED.driver_id`,
-            params,
+        await runner.manager.upsert(
+            PackageAssignment,
+            assignments.map((a) => ({
+                packageId: a.package_id,
+                vehicleId: a.vehicle_id,
+                driverId: a.driver_id,
+            })),
+            ['packageId'],
         );
     }
 

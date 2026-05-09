@@ -5,9 +5,16 @@ import {
     InternalServerErrorException,
     Logger,
 } from '@nestjs/common';
+import { InjectRepository } from '@nestjs/typeorm';
 import { SupabaseClient } from '@supabase/supabase-js';
+import { In, Repository } from 'typeorm';
 import { SUPABASE_CLIENT } from 'src/supabase/supabase.provider';
 import { DatabaseService } from 'src/database/database.service';
+import { AppPermission } from 'src/entities/app-permission.entity';
+import { AppRole } from 'src/entities/app-role.entity';
+import { Driver } from 'src/entities/driver.entity';
+import { TeamMember } from 'src/entities/team-member.entity';
+import { UserPermission } from 'src/entities/user-permission.entity';
 import { CreateUserDto } from './dto/create-user.dto';
 import { DeactivateUsersDto } from './dto/deactivate-users.dto';
 import { ReactivateUsersDto } from './dto/reactivate-users.dto';
@@ -44,34 +51,32 @@ export class UsersService {
         @Inject(SUPABASE_CLIENT)
         private readonly supabase: SupabaseClient,
         private readonly db: DatabaseService,
+        @InjectRepository(AppRole) private readonly appRoleRepo: Repository<AppRole>,
+        @InjectRepository(AppPermission) private readonly appPermissionRepo: Repository<AppPermission>,
     ) { }
 
     async createUser(dto: CreateUserDto): Promise<CreateUserResult> {
         // Look up the role by name. Fail fast before touching auth so there is
         // nothing to clean up if the caller passes a bad role.
-        const roleRows = await this.db.query<{ id: string; name: string }>(
-            `SELECT id, name FROM app_roles WHERE name = $1 LIMIT 1`,
-            [dto.user_role],
-        );
-        if (!roleRows.length) {
+        const role = await this.appRoleRepo.findOne({
+            where: { name: dto.user_role },
+            select: { id: true, name: true },
+        });
+        if (!role) {
             throw new BadRequestException(
                 `Role "${dto.user_role}" does not exist`,
             );
         }
-        // TypeORM returns Postgres bigint columns as strings
-        const roleId: string = roleRows[0].id;
-        const isDriver = roleRows[0].name === 'Driver';
+        const roleId = role.id;
+        const isDriver = role.name === 'Driver';
 
         // Deduplicate and validate permission strings.
         const uniquePermissions = [...new Set(dto.user_permission ?? [])];
-        // TypeORM returns Postgres bigint columns as strings
-        let permissionIds: string[] = [];
+        let permissionIds: number[] = [];
         if (uniquePermissions.length > 0) {
-            const placeholders = uniquePermissions.map((_, i) => `$${i + 1}`).join(', ');
-            const permRows = await this.db.query<{ id: string; permission: string }>(
-                `SELECT id, permission FROM app_permission WHERE permission IN (${placeholders})`,
-                uniquePermissions,
-            );
+            const permRows = await this.appPermissionRepo.findBy({
+                permission: In(uniquePermissions),
+            });
             if (permRows.length !== uniquePermissions.length) {
                 const found = new Set(permRows.map((r) => r.permission));
                 const missing = uniquePermissions.filter((p) => !found.has(p));
@@ -114,36 +119,28 @@ export class UsersService {
 
         const runner = await this.db.beginTransaction();
         try {
-            await runner.query(
-                `INSERT INTO team_members (id, role_id) VALUES ($1, $2)`,
-                [userId, roleId],
-            );
+            await runner.manager.insert(TeamMember, { id: userId, roleId });
 
             if (isDriver) {
                 const meta = dto.user_metadata ?? {};
-                await runner.query(
-                    `INSERT INTO drivers
-                        (id, driver_license, license_expiry,
-                         country_of_issue, driver_under_probation, license_type)
-                     VALUES ($1, $2, $3, $4, $5, $6)`,
-                    [
-                        userId,
-                        meta.driver_license ?? null,
-                        meta.license_expiry ?? null,
-                        meta.country_of_issue ?? null,
-                        meta.driver_under_probation ?? null,
-                        meta.license_type ?? null,
-                    ],
-                );
+                await runner.manager.insert(Driver, {
+                    id: userId,
+                    driverLicense: meta.driver_license ?? null,
+                    licenseExpiry: meta.license_expiry ?? null,
+                    countryOfIssue: meta.country_of_issue ?? null,
+                    driverUnderProbation: meta.driver_under_probation ?? null,
+                    licenseType: meta.license_type ?? null,
+                });
             }
 
             if (permissionIds.length > 0) {
-                await runner.query(
-                    `INSERT INTO user_permission (user_id, permission_id)
-                     SELECT $1, unnest($2::bigint[])
-                     ON CONFLICT DO NOTHING`,
-                    [userId, permissionIds],
-                );
+                await runner.manager
+                    .createQueryBuilder()
+                    .insert()
+                    .into(UserPermission)
+                    .values(permissionIds.map((pid) => ({ userId, permissionId: pid })))
+                    .orIgnore()
+                    .execute();
             }
 
             await runner.commitTransaction();
