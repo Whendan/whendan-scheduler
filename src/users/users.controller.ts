@@ -4,6 +4,7 @@ import { RequirePermission } from 'src/auth/decorators/required-permission.decor
 import { CreateUserDto } from './dto/create-user.dto';
 import { DeactivateUsersDto } from './dto/deactivate-users.dto';
 import { ReactivateUsersDto } from './dto/reactivate-users.dto';
+import { UpdateUserRoleDto } from './dto/update-user-role.dto';
 import { UsersService } from './users.service';
 
 @Controller('api/v1/users')
@@ -30,5 +31,12 @@ export class UsersController {
     @RequirePermission('team_members.edit')
     reactivateUsers(@Body() dto: ReactivateUsersDto) {
         return this.usersService.reactivateUsers(dto);
+    }
+
+    @Patch('role')
+    @HttpCode(HttpStatus.OK)
+    @RequirePermission('team_members.edit')
+    updateUserRole(@Body() dto: UpdateUserRoleDto) {
+        return this.usersService.updateUserRole(dto.user_id, dto.role_name);
     }
 }

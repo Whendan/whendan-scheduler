@@ -53,6 +53,7 @@ export class UsersService {
         private readonly db: DatabaseService,
         @InjectRepository(AppRole) private readonly appRoleRepo: Repository<AppRole>,
         @InjectRepository(AppPermission) private readonly appPermissionRepo: Repository<AppPermission>,
+        @InjectRepository(UserPermission) private readonly userPermissionRepo: Repository<UserPermission>,
     ) { }
 
     async createUser(dto: CreateUserDto): Promise<CreateUserResult> {
@@ -215,6 +216,14 @@ export class UsersService {
                     throw new BadRequestException('Cannot deactivate your own account');
                 }
 
+                const [userPermCount, totalPermCount] = await Promise.all([
+                    this.userPermissionRepo.countBy({ userId }),
+                    this.appPermissionRepo.count(),
+                ]);
+                if (totalPermCount > 0 && userPermCount === totalPermCount) {
+                    throw new BadRequestException('Admin accounts cannot be deactivated');
+                }
+
                 const { error: banError } =
                     await this.supabase.auth.admin.updateUserById(userId, {
                         ban_duration: DEACTIVATION_BAN_DURATION,
@@ -289,5 +298,29 @@ export class UsersService {
         }
 
         return { reactivated, failed };
+    }
+
+    async updateUserRole(userId: string, roleName: string): Promise<{ user_id: string; role: string }> {
+        const role = await this.appRoleRepo.findOne({
+            where: { name: roleName },
+            select: { id: true, name: true },
+        });
+        if (!role) {
+            throw new BadRequestException(`Role "${roleName}" does not exist`);
+        }
+
+        const runner = await this.db.beginTransaction();
+        try {
+            await runner.manager.update(TeamMember, { id: userId }, { roleId: role.id });
+            await runner.commitTransaction();
+        } catch (dbError) {
+            await runner.rollbackTransaction();
+            const msg = (dbError as Error).message ?? String(dbError);
+            throw new InternalServerErrorException(`Failed to update role: ${msg}`);
+        } finally {
+            await runner.release();
+        }
+
+        return { user_id: userId, role: role.name };
     }
 }
